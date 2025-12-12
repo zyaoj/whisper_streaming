@@ -109,14 +109,16 @@ class FasterWhisperASR(ASRBase):
         if model_dir is not None:
             logger.debug(f"Loading whisper model from model_dir {model_dir}. modelsize and cache_dir parameters are not used.")
             model_size_or_path = model_dir
+            local_files_only = True  # Prevent treating path as HuggingFace repo ID
         elif modelsize is not None:
             model_size_or_path = modelsize
+            local_files_only = False
         else:
             raise ValueError("modelsize or model_dir parameter must be set")
 
 
         # this worked fast and reliably on NVIDIA L40
-        model = WhisperModel(model_size_or_path, device="cuda", compute_type="float16", download_root=cache_dir)
+        model = WhisperModel(model_size_or_path, device="cuda", compute_type="float16", download_root=cache_dir, local_files_only=local_files_only)
 
         # or run on GPU with INT8
         # tested: the transcripts were different, probably worse than with FP16, and it was slightly (appx 20%) slower
@@ -542,7 +544,19 @@ class OnlineASRProcessor:
         self.chunk_at(chunk_at)
 
     def chunk_completed_segment(self, res):
-        if self.commited == []: return
+        if self.commited == []:
+            # Fallback: Even without committed text, trim the buffer if it's too large
+            # This prevents unbounded buffer growth during silence/no-speech periods
+            buffer_duration = len(self.audio_buffer) / self.SAMPLING_RATE
+            if buffer_duration > self.buffer_trimming_sec * 2:
+                # Keep only the most recent buffer_trimming_sec seconds
+                keep_samples = int(self.buffer_trimming_sec * self.SAMPLING_RATE)
+                trim_samples = len(self.audio_buffer) - keep_samples
+                trim_seconds = trim_samples / self.SAMPLING_RATE
+                self.audio_buffer = self.audio_buffer[-keep_samples:]
+                self.buffer_time_offset += trim_seconds
+                logger.debug(f"--- buffer trimmed (no commits): kept last {self.buffer_trimming_sec:.1f}s, new offset {self.buffer_time_offset:.2f}s")
+            return
 
         ends = self.asr.segments_end_ts(res)
 
